@@ -42,14 +42,59 @@ def append_row(ws, row):
   ws.append_row(row, value_input_option="RAW")
 
 # ---- Utils ----
-def detect_delimiter(first_line): return ";" if first_line.count(";") > first_line.count(",") else ","
+def detect_delimiter(first_line): 
+  return ";" if first_line.count(";") > first_line.count(",") else ","
+
+# Robuuste parsers (fix voor "could not convert string to float")
 def to_float(x):
-  s = str(x or "").strip().replace(",", ".")
-  try: return float(s) if s else 0.0
-  except: return 0.0
+  """
+  Accepteert o.a.: €1.234,56  |  1,234.56  |  12,34  |  35%  |  ' n/a '  |  '-'
+  """
+  if x is None: 
+    return 0.0
+  s = str(x).strip()
+  if s == "" or s.lower() in {"nan", "n/a", "na", "-", "—"}:
+    return 0.0
+
+  # percentage?
+  if s.endswith("%"):
+    num = s[:-1].strip()
+    v = to_float(num)
+    return v / 100.0
+
+  # verwijder valuta, spaties, niet-relevante tekens
+  s = re.sub(r"[^0-9,.\-]", "", s)
+  if s in {"", "-", "--"}:
+    return 0.0
+
+  # Detecteer EU (1.234,56) vs EN (1,234.56)
+  last_dot = s.rfind(".")
+  last_comma = s.rfind(",")
+  if last_comma > last_dot:
+    # EU: punten zijn duizendtallen, komma is decimaal
+    s = s.replace(".", "")
+    s = s.replace(",", ".")
+  else:
+    # EN: komma's zijn duizendtallen, punt is decimaal
+    s = s.replace(",", "")
+
+  try:
+    return float(s)
+  except ValueError:
+    return 0.0
+
 def to_int(x):
-  try: return int(float(str(x or "").replace(",", ".")))
-  except: return 0
+  """ Integers tolerant: pakt cijfers (en minteken), negeert overige tekens. """
+  if x is None:
+    return 0
+  s = re.sub(r"[^0-9\-]", "", str(x).strip())
+  if s in {"", "-", "--"}:
+    return 0
+  try:
+    return int(float(s))
+  except:
+    return 0
+
 def short_html(html, n=180):
   return re.sub(r"\s+", " ", str(html or "")).strip()[:n]
 
@@ -179,10 +224,14 @@ def load_rules_from_sheet(ss):
   rules=[]
   for r in rows:
     if not any(r): continue
+    # margin_pct accepteert 0.35, 35 of 35%
+    mp = to_float(r[idx["margin_pct"]])
+    if mp > 1.0:
+      mp = mp / 100.0
     rules.append({
       "min_cost": to_float(r[idx["min_cost"]]),
       "max_cost": to_float(r[idx["max_cost"]]),
-      "margin_pct": to_float(r[idx["margin_pct"]]),
+      "margin_pct": mp,
       "round_to": to_float(r[idx["round_to"]]),
       "price_end": (r[idx["price_end"]] if idx.get("price_end") is not None else "").strip()
     })
