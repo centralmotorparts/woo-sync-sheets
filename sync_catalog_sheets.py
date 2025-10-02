@@ -1,4 +1,4 @@
-import os, sys, time, math, csv, re, logging
+import os, sys, time, math, csv, re, logging, html
 from io import StringIO
 import requests, pandas as pd
 import gspread
@@ -14,6 +14,7 @@ WOO_KEY          = os.environ["WOO_KEY"]
 WOO_SECRET       = os.environ["WOO_SECRET"]
 SHEET_ID         = os.environ["SHEET_ID"]
 BATCH_SLEEP      = float(os.getenv("BATCH_SLEEP", "0.10"))
+PREFETCH_PRODUCTS = (os.getenv("PREFETCH_PRODUCTS", "true").strip().lower() == "true")
 CREDS_FILE       = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
 
 # ---- Google Sheets helpers ----
@@ -42,70 +43,82 @@ def append_row(ws, row):
   ws.append_row(row, value_input_option="RAW")
 
 # ---- Utils ----
-def detect_delimiter(first_line): 
+def detect_delimiter(first_line):
   return ";" if first_line.count(";") > first_line.count(",") else ","
 
-# Robuuste parsers (fix voor "could not convert string to float")
+# robuuste parsers
 def to_float(x):
-  """
-  Accepteert o.a.: €1.234,56  |  1,234.56  |  12,34  |  35%  |  ' n/a '  |  '-'
-  """
+  """ Accepteert €1.234,56 / 1,234.56 / 12,34 / 35% / n/a / - """
   if x is None: 
     return 0.0
   s = str(x).strip()
   if s == "" or s.lower() in {"nan", "n/a", "na", "-", "—"}:
     return 0.0
-
-  # percentage?
   if s.endswith("%"):
-    num = s[:-1].strip()
-    v = to_float(num)
-    return v / 100.0
-
-  # verwijder valuta, spaties, niet-relevante tekens
+    return to_float(s[:-1]) / 100.0
   s = re.sub(r"[^0-9,.\-]", "", s)
-  if s in {"", "-", "--"}:
-    return 0.0
-
-  # Detecteer EU (1.234,56) vs EN (1,234.56)
-  last_dot = s.rfind(".")
-  last_comma = s.rfind(",")
+  if s in {"", "-", "--"}: return 0.0
+  last_dot, last_comma = s.rfind("."), s.rfind(",")
   if last_comma > last_dot:
-    # EU: punten zijn duizendtallen, komma is decimaal
-    s = s.replace(".", "")
-    s = s.replace(",", ".")
+    s = s.replace(".", "").replace(",", ".")
   else:
-    # EN: komma's zijn duizendtallen, punt is decimaal
     s = s.replace(",", "")
-
   try:
     return float(s)
   except ValueError:
     return 0.0
 
 def to_int(x):
-  """ Integers tolerant: pakt cijfers (en minteken), negeert overige tekens. """
-  if x is None:
-    return 0
-  s = re.sub(r"[^0-9\-]", "", str(x).strip())
-  if s in {"", "-", "--"}:
-    return 0
+  s = re.sub(r"[^0-9\-]", "", str(x or "").strip())
+  if s in {"", "-", "--"}: return 0
   try:
     return int(float(s))
   except:
     return 0
 
-def short_html(html, n=180):
-  return re.sub(r"\s+", " ", str(html or "")).strip()[:n]
+def short_html(html_txt, n=180):
+  return re.sub(r"\s+", " ", str(html_txt or "")).strip()[:n]
+
+# --- Categorie naam-normalisatie (fix voor &, &amp;, NBSP, dubbele spaties) ---
+def clean_cat_name(s: str) -> str:
+  """Netjes voor aanmaken: unescape, NBSP->spatie, spaties comprimeren, trim (behoud hoofdletters & &)"""
+  txt = html.unescape(str(s or ""))
+  txt = txt.replace("\u00A0", " ")
+  txt = re.sub(r"\s+", " ", txt).strip()
+  return txt
+
+def norm_cat_name(s: str) -> str:
+  """Voor lookup keys: clean + lowercase"""
+  return clean_cat_name(s).lower()
+
+def norm_path_key(path: str) -> str:
+  """Genormaliseerde key voor volledige paden 'A > B > C' """
+  if not path: return ""
+  parts = [p for p in (p.strip() for p in str(path).split(">")) if p]
+  parts = [norm_cat_name(p) for p in parts]
+  return " > ".join(parts)
+
+def clean_path_display(path: str) -> str:
+  if not path: return ""
+  parts = [p for p in (p.strip() for p in str(path).split(">")) if p]
+  parts = [clean_cat_name(p) for p in parts]
+  return " > ".join(parts)
 
 # ---- Woo client ----
 class Woo:
-  def __init__(self, base, key, secret, sleep=BATCH_SLEEP):
+  def __init__(self, base, key, secret, sleep=BATCH_SLEEP, prefetch=True):
     self.base = base + "/wp-json/wc/v3"
     self.session = requests.Session()
     self.session.auth = (key, secret)
     self.sleep = sleep
-    self._cat = None  # {(name_lower, parent_id): obj}
+    self._cat = None  # {(norm_name, parent_id): obj}
+    self._cat_path_cache = {}  # {norm_path_key: leaf_id}
+    self._sku_index = {}  # {sku: id}
+    if prefetch:
+      try:
+        self.build_sku_index()
+      except Exception as e:
+        log.warning("Prefetch SKUs failed (fallback to per-sku GET): %s", e)
 
   def _get(self, path, params=None):
     r = self.session.get(self.base + path, params=params or {}, timeout=60)
@@ -117,62 +130,115 @@ class Woo:
     r = self.session.put(self.base + path, json=json_body or {}, timeout=60)
     time.sleep(self.sleep); return r
 
-  def product_by_sku(self, sku):
+  # ----- Products
+  def build_sku_index(self):
+    """Prefetch alle producten (id, sku) in pages van 100 om GET per SKU te vermijden."""
+    log.info("Prefetching all product SKUs …")
+    page = 1
+    count = 0
+    while True:
+      r = self._get("/products", {"per_page": 100, "page": page})
+      if r.status_code != 200:
+        raise RuntimeError(f"GET products page {page}: {r.status_code} {r.text[:200]}")
+      arr = r.json()
+      if not arr: break
+      for p in arr:
+        sku = str(p.get("sku") or "").strip()
+        pid = p.get("id")
+        if sku and pid:
+          self._sku_index[sku] = pid
+          count += 1
+      if len(arr) < 100: break
+      page += 1
+    log.info("SKU index size: %d", count)
+
+  def sku_to_id(self, sku: str):
+    sku = str(sku or "").strip()
+    if not sku: return None
+    pid = self._sku_index.get(sku)
+    if pid: return pid
+    # fallback: per-sku GET
     r = self._get("/products", {"sku": sku, "per_page": 1})
-    if r.status_code != 200: raise RuntimeError(f"GET product {sku}: {r.status_code} {r.text[:300]}")
-    arr = r.json(); return arr[0] if arr else None
+    if r.status_code != 200:
+      raise RuntimeError(f"GET product {sku}: {r.status_code} {r.text[:200]}")
+    arr = r.json()
+    if arr:
+      pid = arr[0]["id"]
+      self._sku_index[sku] = pid
+      return pid
+    return None
 
   def create_product(self, body):
     r = self._post("/products", body)
-    if r.status_code not in (200,201): raise RuntimeError(f"POST product: {r.status_code} {r.text[:300]}")
-    return r.json()
+    if r.status_code not in (200,201): 
+      raise RuntimeError(f"POST product: {r.status_code} {r.text[:300]}")
+    p = r.json()
+    sku = str(p.get("sku") or "").strip()
+    if sku and p.get("id"):
+      self._sku_index[sku] = p["id"]
+    return p
 
   def update_product(self, pid, body):
     r = self._put(f"/products/{pid}", body)
-    if r.status_code != 200: raise RuntimeError(f"PUT product {pid}: {r.status_code} {r.text[:300]}")
+    if r.status_code != 200:
+      raise RuntimeError(f"PUT product {pid}: {r.status_code} {r.text[:300]}")
     return r.json()
 
-  # --- categories
+  # ----- Categories
   def _load_cats(self):
     if self._cat is not None: return self._cat
     page=1; allc=[]
     while True:
       r = self._get("/products/categories", {"per_page":100, "page":page})
-      if r.status_code != 200: raise RuntimeError(f"GET categories: {r.status_code} {r.text[:300]}")
+      if r.status_code != 200: 
+        raise RuntimeError(f"GET categories: {r.status_code} {r.text[:300]}")
       batch = r.json(); allc += batch
       if len(batch) < 100: break
       page += 1
     cache={}
     for c in allc:
-      name = (c.get("name") or "").strip().lower()
+      name_key = norm_cat_name(c.get("name") or "")
       parent = c.get("parent") or 0
-      cache[(name, parent)] = c
+      cache[(name_key, parent)] = c
     self._cat = cache
     return cache
 
   def _find_cat_id(self, name, parent):
-    c = self._load_cats().get((name.strip().lower(), parent or 0))
+    c = self._load_cats().get((norm_cat_name(name), parent or 0))
     return c["id"] if c else None
 
   def _create_cat(self, name, parent):
-    body = {"name": name.strip()}
+    # maak nette display-naam
+    clean_name = clean_cat_name(name)
+    body = {"name": clean_name}
     if parent: body["parent"] = parent
     r = self._post("/products/categories", body)
-    if r.status_code not in (200,201): raise RuntimeError(f"POST category {name}: {r.status_code} {r.text[:300]}")
+    if r.status_code not in (200,201):
+      raise RuntimeError(f"POST category {clean_name}: {r.status_code} {r.text[:300]}")
     c = r.json()
-    self._load_cats()[(c["name"].strip().lower(), c.get("parent") or 0)] = c
+    # cache updaten op genormaliseerde key
+    self._load_cats()[(norm_cat_name(c.get("name") or ""), c.get("parent") or 0)] = c
     return c["id"]
 
   def ensure_cat_path(self, path):
+    """Zorg dat 'A > B > C' bestaat; return leaf-id, met path- en naam-normalisatie + padcache."""
     if not path: return None
-    parts = [p.strip() for p in path.split(">") if p.strip()]
+    norm_key = norm_path_key(path)
+    if norm_key in self._cat_path_cache:
+      return self._cat_path_cache[norm_key]
+
+    parts_raw = [p for p in (p.strip() for p in str(path).split(">")) if p]
     parent = 0; leaf=None
-    for name in parts:
-      cid = self._find_cat_id(name, parent)
-      if cid: leaf=cid; parent=cid
+    for part in parts_raw:
+      # zoeken op genormaliseerde naam, aanmaken met nette display-naam
+      cid = self._find_cat_id(part, parent)
+      if cid:
+        leaf = cid; parent = cid
       else:
-        cid = self._create_cat(name, parent if parent else None)
-        leaf=cid; parent=cid
+        cid = self._create_cat(part, parent if parent else None)
+        leaf = cid; parent = cid
+
+    self._cat_path_cache[norm_key] = leaf
     return leaf
 
 # ---- Load supplier CSV ----
@@ -185,8 +251,8 @@ def load_supplier_df(url):
   return df
 
 def build_supplier_cat(row):
-  chap = (row.get("ChapterName") or "").strip()
-  cat  = (row.get("CategoryName") or "").strip()
+  chap = clean_cat_name((row.get("ChapterName") or "").strip())
+  cat  = clean_cat_name((row.get("CategoryName") or "").strip())
   return f"{chap} > {cat}" if chap and cat else (chap or cat or "")
 
 # ---- Read MAP & RULES from Sheet ----
@@ -200,10 +266,11 @@ def load_map_from_sheet(ss):
   m={}
   for r in rows:
     if not r: continue
-    key = (r[idx.get("category_supplier", -1)] if idx.get("category_supplier", -1) >=0 else "").strip()
-    if not key: continue
-    m[key] = {
-      "category_woo": (r[idx.get("category_woo", -1)] if idx.get("category_woo", -1)>=0 else "").strip(),
+    supplier_raw = (r[idx.get("category_supplier", -1)] if idx.get("category_supplier", -1) >=0 else "").strip()
+    if not supplier_raw: continue
+    key_norm = norm_path_key(supplier_raw)
+    m[key_norm] = {
+      "category_woo": clean_path_display(r[idx.get("category_woo", -1)] if idx.get("category_woo", -1)>=0 else ""),
       "tax_class": (r[idx.get("tax_class", -1)] if idx.get("tax_class", -1)>=0 else "").strip(),
       "attribute_map_json": (r[idx.get("attribute_map_json", -1)] if idx.get("attribute_map_json", -1)>=0 else "").strip(),
     }
@@ -224,10 +291,8 @@ def load_rules_from_sheet(ss):
   rules=[]
   for r in rows:
     if not any(r): continue
-    # margin_pct accepteert 0.35, 35 of 35%
     mp = to_float(r[idx["margin_pct"]])
-    if mp > 1.0:
-      mp = mp / 100.0
+    if mp > 1.0: mp = mp / 100.0  # 35 / 35% -> 0.35
     rules.append({
       "min_cost": to_float(r[idx["min_cost"]]),
       "max_cost": to_float(r[idx["max_cost"]]),
@@ -266,14 +331,18 @@ def transform_to_staging(df_raw, mapping, rules):
                 (row.get("Description") or "").strip()
     short_desc = short_html(long_desc, 180)
     title = (row.get("ProductTitle") or row.get("Description") or sku).strip()
-    supplier_cat = build_supplier_cat(row)
-    mapped = mapping.get(supplier_cat, {"category_woo":"","tax_class":"","attribute_map_json":""})
+    supplier_cat_display = build_supplier_cat(row)
+    supplier_key = norm_path_key(supplier_cat_display)
+    mapped = mapping.get(supplier_key, {"category_woo":"","tax_class":"","attribute_map_json":""})
     cost   = to_float(row.get("DealerPrice"))
     stock  = max(0, to_int(row.get("StockQuantity")))
     price  = apply_margin(cost, rules)
-    imgs = [u for u in [(row.get("Picture1") or "").strip(),
-                        (row.get("Picture2") or "").strip(),
-                        (row.get("Picture3") or "").strip()] if u]
+    imgs = [u for u in [
+      (row.get("Picture1") or "").strip(),
+      (row.get("Picture2") or "").strip(),
+      (row.get("Picture3") or "").strip()
+    ] if u]
+
     out.append([
       sku, title, short_desc, long_desc, (row.get("BrandName") or "").strip(),
       mapped.get("category_woo",""), mapped.get("tax_class",""),
@@ -284,7 +353,6 @@ def transform_to_staging(df_raw, mapping, rules):
 def to_woo_body(row_dict, woo: Woo):
   imgs = [{"src": u} for u in (row_dict["images"].split(",") if row_dict["images"] else []) if u]
 
-  # parse met to_float zodat 134,95 en 134.95 beide werken
   price_val = to_float(row_dict.get("price"))
   stock_val = int(to_float(row_dict.get("stock")))
   cost_val  = to_float(row_dict.get("cost_price"))
@@ -300,33 +368,26 @@ def to_woo_body(row_dict, woo: Woo):
     "images": imgs,
     "status": row_dict.get("status") or "publish"
   }
+  if row_dict.get("tax_class"): body["tax_class"] = row_dict["tax_class"]
 
-  if row_dict.get("tax_class"):
-    body["tax_class"] = row_dict["tax_class"]
-
-  # categorie (pad) -> ID
+  # categorie (pad) -> ID (normalisatie + padcache in Woo)
   cat_path = row_dict.get("category_woo") or ""
   if cat_path:
     try:
-      cid = woo.ensure_cat_path(cat_path)
-      if cid:
-        body["categories"] = [{"id": cid}]
+      # clean display path zodat &amp; etc. goed komen
+      path_clean = clean_path_display(cat_path)
+      cid = woo.ensure_cat_path(path_clean)
+      if cid: body["categories"] = [{"id": cid}]
     except Exception as e:
       log.warning("Category failed for %s: %s", row_dict["sku"], e)
 
-  # meta-data
-  meta = []
-  if row_dict.get("brand"):
-    meta.append({"key": "_brand", "value": row_dict["brand"]})
-  if cost_val > 0:
-    meta.append({"key": "_cost_price", "value": cost_val})
-  if row_dict.get("ean"):
-    meta.append({"key": "_ean", "value": row_dict["ean"]})
-  if meta:
-    body["meta_data"] = meta
-
+  # meta
+  meta=[]
+  if row_dict.get("brand"):      meta.append({"key":"_brand","value":row_dict["brand"]})
+  if cost_val > 0:               meta.append({"key":"_cost_price","value":cost_val})
+  if row_dict.get("ean"):        meta.append({"key":"_ean","value":row_dict["ean"]})
+  if meta: body["meta_data"] = meta
   return body
-
 
 def main():
   ss = open_sheet(SHEET_ID)
@@ -357,7 +418,7 @@ def main():
   log.info("STAGING updated: %d rows", len(staging_rows))
 
   # Push to Woo
-  woo = Woo(WOO_BASE_URL, WOO_KEY, WOO_SECRET, sleep=BATCH_SLEEP)
+  woo = Woo(WOO_BASE_URL, WOO_KEY, WOO_SECRET, sleep=BATCH_SLEEP, prefetch=PREFETCH_PRODUCTS)
   h, rows = read_table(get_ws(ss, "STAGING"))
   idx = {h:i for i,h in enumerate(h)}
   created=updated=errors=0
@@ -367,10 +428,10 @@ def main():
     try:
       sku = str(row["sku"]).strip()
       if not sku: continue
-      exists = woo.product_by_sku(sku)
+      pid = woo.sku_to_id(sku)
       body = to_woo_body(row, woo)
-      if exists:
-        woo.update_product(exists["id"], body); updated += 1
+      if pid:
+        woo.update_product(pid, body); updated += 1
       else:
         woo.create_product(body); created += 1
       if i % 25 == 0 or i == len(rows):
