@@ -283,31 +283,50 @@ def transform_to_staging(df_raw, mapping, rules):
 
 def to_woo_body(row_dict, woo: Woo):
   imgs = [{"src": u} for u in (row_dict["images"].split(",") if row_dict["images"] else []) if u]
+
+  # parse met to_float zodat 134,95 en 134.95 beide werken
+  price_val = to_float(row_dict.get("price"))
+  stock_val = int(to_float(row_dict.get("stock")))
+  cost_val  = to_float(row_dict.get("cost_price"))
+
   body = {
     "name": row_dict["name"],
     "sku": str(row_dict["sku"]).strip(),
-    "regular_price": f'{float(row_dict["price"]):.2f}',
+    "regular_price": f"{price_val:.2f}",
     "description": row_dict.get("long_description") or "",
     "short_description": row_dict.get("short_description") or "",
     "manage_stock": True,
-    "stock_quantity": int(float(row_dict.get("stock") or 0)),
+    "stock_quantity": stock_val,
     "images": imgs,
     "status": row_dict.get("status") or "publish"
   }
-  if row_dict.get("tax_class"): body["tax_class"] = row_dict["tax_class"]
+
+  if row_dict.get("tax_class"):
+    body["tax_class"] = row_dict["tax_class"]
+
+  # categorie (pad) -> ID
   cat_path = row_dict.get("category_woo") or ""
   if cat_path:
     try:
       cid = woo.ensure_cat_path(cat_path)
-      if cid: body["categories"] = [{"id": cid}]
+      if cid:
+        body["categories"] = [{"id": cid}]
     except Exception as e:
       log.warning("Category failed for %s: %s", row_dict["sku"], e)
-  meta=[]
-  if row_dict.get("brand"): meta.append({"key":"_brand","value":row_dict["brand"]})
-  if row_dict.get("cost_price"): meta.append({"key":"_cost_price","value":row_dict["cost_price"]})
-  if row_dict.get("ean"): meta.append({"key":"_ean","value":row_dict["ean"]})
-  if meta: body["meta_data"]=meta
+
+  # meta-data
+  meta = []
+  if row_dict.get("brand"):
+    meta.append({"key": "_brand", "value": row_dict["brand"]})
+  if cost_val > 0:
+    meta.append({"key": "_cost_price", "value": cost_val})
+  if row_dict.get("ean"):
+    meta.append({"key": "_ean", "value": row_dict["ean"]})
+  if meta:
+    body["meta_data"] = meta
+
   return body
+
 
 def main():
   ss = open_sheet(SHEET_ID)
