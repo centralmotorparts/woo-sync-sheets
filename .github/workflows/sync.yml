@@ -1,14 +1,15 @@
 name: Woo Sync (Sheets)
 
 on:
-  workflow_dispatch: {}   # handmatig starten via Actions
+  workflow_dispatch: {}
   schedule:
-    - cron: "5 2 * * *"   # dagelijks 02:05 UTC (≈ 03:05/04:05 NL)
+    - cron: "5 2 * * *"   # dagelijks 02:05 UTC
 
 jobs:
   run-sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # tot 6 uur runtime
+    timeout-minutes: 360
+
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -23,10 +24,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # ❗ Schrijft de Google Service Account JSON naar een bestand dat het script leest
       - name: Write Google credentials file
-  run: |
-    echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > $GITHUB_WORKSPACE/creds.json
-
+        shell: bash
+        run: |
+          printf '%s' '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > "$GITHUB_WORKSPACE/creds.json"
 
       - name: Run sync
         env:
