@@ -13,7 +13,7 @@ WOO_BASE_URL     = os.environ["WOO_BASE_URL"].rstrip("/")
 WOO_KEY          = os.environ["WOO_KEY"]
 WOO_SECRET       = os.environ["WOO_SECRET"]
 SHEET_ID         = os.environ["SHEET_ID"]
-BATCH_SLEEP      = float(os.getenv("BATCH_SLEEP", "0.10"))
+BATCH_SLEEP      = float(os.getenv("BATCH_SLEEP", "0.50"))
 PREFETCH_PRODUCTS = (os.getenv("PREFETCH_PRODUCTS", "true").strip().lower() == "true")
 CREDS_FILE       = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
 
