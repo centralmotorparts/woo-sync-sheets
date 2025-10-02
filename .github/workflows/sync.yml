@@ -1,0 +1,40 @@
+name: Woo Sync (Sheets)
+
+on:
+  workflow_dispatch: {}   # handmatig starten via Actions
+  schedule:
+    - cron: "5 2 * * *"   # dagelijks 02:05 UTC (≈ 03:05/04:05 NL)
+
+jobs:
+  run-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # tot 6 uur runtime
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Write Google credentials file
+        run: |
+          echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > $HOME/creds.json
+
+      - name: Run sync
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/creds.json
+          SUPPLIER_CSV_URL: ${{ secrets.SUPPLIER_CSV_URL }}
+          WOO_BASE_URL: ${{ secrets.WOO_BASE_URL }}
+          WOO_KEY: ${{ secrets.WOO_KEY }}
+          WOO_SECRET: ${{ secrets.WOO_SECRET }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          BATCH_SLEEP: "0.10"
+        run: |
+          python sync_catalog_sheets.py
