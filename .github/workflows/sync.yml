@@ -24,8 +24,9 @@ jobs:
           pip install -r requirements.txt
 
       - name: Write Google credentials file
-        run: |
-          echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > $HOME/creds.json
+  run: |
+    echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > $GITHUB_WORKSPACE/creds.json
+
 
       - name: Run sync
         env:
