@@ -262,19 +262,36 @@ def load_map_from_sheet(ss):
   if not headers:
     write_table(ws, ["category_supplier","category_woo","tax_class","attribute_map_json"], [])
     return {}
-  idx = {h:i for i,h in enumerate(headers)}
-  m={}
+
+  # headers case-insensitive & get index safely
+  hdr_norm = [str(h or '').strip().lower() for h in headers]
+  def col(name):
+    try:
+      return hdr_norm.index(name.lower())
+    except ValueError:
+      return -1
+
+  ix_sup = col("category_supplier")
+  ix_woo = col("category_woo")
+  ix_tax = col("tax_class")
+  ix_att = col("attribute_map_json")
+
+  m = {}
   for r in rows:
-    if not r: continue
-    supplier_raw = (r[idx.get("category_supplier", -1)] if idx.get("category_supplier", -1) >=0 else "").strip()
-    if not supplier_raw: continue
-    key_norm = norm_path_key(supplier_raw)
+    if not r: 
+      continue
+    supplier_raw = (r[ix_sup] if ix_sup >= 0 and ix_sup < len(r) else "").strip()
+    if not supplier_raw:
+      continue
+    key_norm = norm_path_key(supplier_raw)  # << genormaliseerde sleutel
+    category_woo_display = clean_path_display(r[ix_woo] if ix_woo >= 0 and ix_woo < len(r) else "")
     m[key_norm] = {
-      "category_woo": clean_path_display(r[idx.get("category_woo", -1)] if idx.get("category_woo", -1)>=0 else ""),
-      "tax_class": (r[idx.get("tax_class", -1)] if idx.get("tax_class", -1)>=0 else "").strip(),
-      "attribute_map_json": (r[idx.get("attribute_map_json", -1)] if idx.get("attribute_map_json", -1)>=0 else "").strip(),
+      "category_woo": category_woo_display,
+      "tax_class": (r[ix_tax] if ix_tax >= 0 and ix_tax < len(r) else "").strip(),
+      "attribute_map_json": (r[ix_att] if ix_att >= 0 and ix_att < len(r) else "").strip(),
     }
   return m
+
 
 def load_rules_from_sheet(ss):
   ws = get_ws(ss, "RULES")
